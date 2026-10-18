@@ -1,0 +1,94 @@
+name: bot
+
+on:
+  schedule:
+    - cron: '7 */6 * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: bot-run
+  cancel-in-progress: true
+
+jobs:
+  gate:
+    runs-on: ubuntu-latest
+    outputs:
+      active: ${{ steps.check.outputs.active }}
+    steps:
+      - id: check
+        shell: bash
+        run: |
+          day_index=$(( ( $(date -u +%s) / 86400 ) % 2 + 1 ))
+          repo_name="${{ github.event.repository.name }}"
+          my_index="${repo_name##*_}"
+          if [ "$my_index" = "$day_index" ]; then
+            echo "active=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "active=false" >> "$GITHUB_OUTPUT"
+          fi
+
+  run:
+    needs: gate
+    if: needs.gate.outputs.active == 'true' || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - name: Checkout runner repository
+        uses: actions/checkout@v4
+
+      - name: Delete Telegram webhook
+        env:
+          BOT_TOKEN: "${{ secrets.BOT_TOKEN }}"
+        run: curl -fsS -X POST "https://api.telegram.org/bot${BOT_TOKEN}/deleteWebhook" -o /dev/null || true
+
+      - name: Fetch source code
+        env:
+          SRC_TOKEN: "${{ secrets.SRC_TOKEN }}"
+          SRC_REPO: "bpbbpbtest/SoosisTest_source"
+        run: |
+          mkdir -p src
+          curl -fsSL -H "Authorization: token ${SRC_TOKEN}" -H "Accept: application/vnd.github+json" "https://api.github.com/repos/${SRC_REPO}/tarball" -o /tmp/source.tar.gz
+          tar -xzf /tmp/source.tar.gz -C src --strip-components=1
+          rm -f /tmp/source.tar.gz
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      - name: Install dependencies
+        working-directory: src
+        run: |
+          if [ -f package-lock.json ]; then
+            npm ci
+          elif [ -f package.json ]; then
+            npm install
+          fi
+
+      - name: Heartbeat
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          date -u +%Y-%m-%dT%H:%M:%SZ > .heartbeat
+          git add .heartbeat
+          git commit -m "chore: heartbeat" > /dev/null 2>&1 || true
+          git push > /dev/null 2>&1 || true
+
+      - name: Run bot
+        working-directory: src
+        env:
+          BOT_TOKEN: "${{ secrets.BOT_TOKEN }}"
+          BOT_CMD: "npm run start"
+
+        run: |
+          deadline=$((SECONDS + 21000))
+          while [ "$SECONDS" -lt "$deadline" ]; do
+            bash -c "$BOT_CMD" || true
+            sleep 10
+          done
